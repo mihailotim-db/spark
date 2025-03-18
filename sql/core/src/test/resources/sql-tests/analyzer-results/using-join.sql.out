@@ -568,7 +568,7 @@ SELECT k FROM (SELECT nt2.k FROM nt1 full outer join nt2 using (k))
 Project [k#x]
 +- SubqueryAlias __auto_generated_subquery_name
    +- Project [k#x]
-      +- Project [coalesce(k#x, k#x) AS k#x, v1#x, v2#x, k#x, k#x]
+      +- Project [coalesce(k#x, k#x) AS k#x, v1#x, v2#x, k#x]
          +- Join FullOuter, (k#x = k#x)
             :- SubqueryAlias nt1
             :  +- View (`nt1`, [k#x, v1#x])
