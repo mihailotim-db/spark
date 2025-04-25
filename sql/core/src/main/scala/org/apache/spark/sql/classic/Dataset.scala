@@ -19,17 +19,14 @@ package org.apache.spark.sql.classic
 
 import java.io.{ByteArrayOutputStream, CharArrayWriter, DataOutputStream}
 import java.util
-
 import scala.collection.mutable.{ArrayBuffer, HashSet}
 import scala.jdk.CollectionConverters._
 import scala.reflect.ClassTag
 import scala.reflect.runtime.universe.TypeTag
 import scala.util.control.NonFatal
-
 import org.apache.commons.lang3.StringUtils
 import org.apache.commons.text.StringEscapeUtils
-
-import org.apache.spark.{sql, TaskContext}
+import org.apache.spark.{TaskContext, sql}
 import org.apache.spark.annotation.{DeveloperApi, Stable, Unstable}
 import org.apache.spark.api.java.JavaRDD
 import org.apache.spark.api.java.function._
@@ -43,13 +40,13 @@ import org.apache.spark.sql.catalyst.{CatalystTypeConverters, InternalRow, Query
 import org.apache.spark.sql.catalyst.analysis._
 import org.apache.spark.sql.catalyst.catalog.HiveTableRelation
 import org.apache.spark.sql.catalyst.encoders._
-import org.apache.spark.sql.catalyst.encoders.AgnosticEncoders.{agnosticEncoderFor, ProductEncoder, StructEncoder}
+import org.apache.spark.sql.catalyst.encoders.AgnosticEncoders.{ProductEncoder, StructEncoder, agnosticEncoderFor}
 import org.apache.spark.sql.catalyst.expressions._
-import org.apache.spark.sql.catalyst.json.{JacksonGenerator, JSONOptions}
+import org.apache.spark.sql.catalyst.json.{JSONOptions, JacksonGenerator}
 import org.apache.spark.sql.catalyst.parser.{ParseException, ParserUtils}
 import org.apache.spark.sql.catalyst.plans._
 import org.apache.spark.sql.catalyst.plans.logical._
-import org.apache.spark.sql.catalyst.trees.{TreeNodeTag, TreePattern}
+import org.apache.spark.sql.catalyst.trees.{CurrentOrigin, TreeNodeTag, TreePattern}
 import org.apache.spark.sql.catalyst.types.DataTypeUtils.toAttributes
 import org.apache.spark.sql.catalyst.util.{CharVarcharUtils, IntervalUtils}
 import org.apache.spark.sql.catalyst.util.TypeUtils.toSQLId
@@ -932,8 +929,9 @@ class Dataset[T] private[sql](
     // Replace top-level integer literals in grouping expressions with ordinals, if
     // `groupByOrdinal` is enabled.
     val groupingExpressionsWithOrdinals = cols.map { col => col.expr match {
-      case Literal(value: Int, IntegerType) if sparkSession.sessionState.conf.groupByOrdinal =>
-        UnresolvedOrdinal(value)
+      case literal @ Literal(value: Int, IntegerType)
+          if sparkSession.sessionState.conf.groupByOrdinal =>
+        CurrentOrigin.withOrigin(literal.origin) { UnresolvedOrdinal(value) }
       case other => other
     }}
     RelationalGroupedDataset(
@@ -2246,8 +2244,16 @@ class Dataset[T] private[sql](
   protected def sortInternal(global: Boolean, sortExprs: Seq[Column]): Dataset[T] = {
     val sortOrder: Seq[SortOrder] = sortExprs.map { col =>
       col.expr match {
+        case sortOrderWithOrdinal @ SortOrder(literal @ Literal(value: Int, IntegerType), _, _, _)
+            if sparkSession.sessionState.conf.orderByOrdinal =>
+          val ordinal = CurrentOrigin.withOrigin(literal.origin) { UnresolvedOrdinal(value) }
+          sortOrderWithOrdinal.withNewChildren(newChildren = Seq(ordinal)).asInstanceOf[SortOrder]
         case expr: SortOrder =>
           expr
+        case literal @ Literal(value: Int, IntegerType)
+            if sparkSession.sessionState.conf.orderByOrdinal =>
+          val ordinal = CurrentOrigin.withOrigin(literal.origin) { UnresolvedOrdinal(value) }
+          SortOrder(ordinal, Ascending)
         case expr: Expression =>
           SortOrder(expr, Ascending)
       }
