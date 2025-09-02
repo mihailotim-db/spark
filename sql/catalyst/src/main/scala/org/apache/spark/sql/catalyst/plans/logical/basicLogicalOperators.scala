@@ -110,7 +110,16 @@ case class Project(projectList: Seq[NamedExpression], child: LogicalPlan)
     getAllValidConstraints(projectList)
 
   override def metadataOutput: Seq[Attribute] =
-    getTagValue(Project.hiddenOutputTag).getOrElse(child.metadataOutput)
+    getTagValue(Project.hiddenOutputTag).getOrElse {
+      // Optional short-circuit to prevent recursive scans on deep nested projects when
+      // the current node doesn't introduce any metadata columns.
+      if (SQLConf.get.getConf(com.databricks.sql.DatabricksSQLConf.Optimizer
+            .PROJECT_METADATA_OUTPUT_SHORT_CIRCUIT_ENABLED)) {
+        Nil
+      } else {
+        child.metadataOutput
+      }
+    }
 
   override protected def withNewChildInternal(newChild: LogicalPlan): Project =
     copy(child = newChild)

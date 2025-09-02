@@ -685,6 +685,16 @@ object SQLConf {
       .createWithDefault(true)
 
   val PLANNED_WRITE_ENABLED = buildConf("spark.sql.optimizer.plannedWrite.enabled")
+
+  val PROJECT_METADATA_OUTPUT_SHORT_CIRCUIT_ENABLED =
+    buildConf("spark.sql.optimizer.project.metadataOutput.shortCircuit.enabled")
+      .internal()
+      .doc("When enabled, Project.metadataOutput returns Nil unless hidden metadata is set, " +
+        "to avoid deep recursive scans on large nested projects.")
+      .version("4.0.0")
+      .booleanConf
+      .createWithDefault(true)
+
     .internal()
     .doc("When set to true, Spark optimizer will add logical sort operators to V1 write commands " +
       "if needed so that `FileFormatWriter` does not need to insert physical sorts.")
@@ -2397,6 +2407,15 @@ object SQLConf {
     .createWithDefault(true)
 
   val SUBQUERY_REUSE_ENABLED = buildConf("spark.sql.execution.reuseSubquery")
+
+  val QUERY_TAGGING_COALESCED_TRAVERSAL_ENABLED =
+    buildConf("spark.sql.queryTagging.coalescedTraversal.enabled")
+      .internal()
+      .doc("If enabled, use a single coalesced traversal to detect collation/geospatial tags.")
+      .version("4.0.0")
+      .booleanConf
+      .createWithDefault(true)
+
     .internal()
     .doc("When true, the planner will try to find out duplicated subqueries and re-use them.")
     .version("3.0.0")

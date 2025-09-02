@@ -22,11 +22,16 @@ import java.util.Locale
 import scala.collection.mutable.{HashMap, HashSet}
 import scala.jdk.CollectionConverters._
 
+import org.apache.spark.sql.internal.SQLConf
+import org.apache.spark.sql.util.QueryTaggingUtils
+import org.apache.hadoop.fs.Path
+
 import org.apache.spark.SparkUnsupportedOperationException
 import org.apache.spark.sql.{AnalysisException, SaveMode}
+import org.apache.spark.sql.catalyst.SQLConfHelper
 import org.apache.spark.sql.catalyst.analysis._
 import org.apache.spark.sql.catalyst.catalog._
-import org.apache.spark.sql.catalyst.expressions.{Expression, InputFileBlockLength, InputFileBlockStart, InputFileName, RowOrdering}
+import org.apache.spark.sql.catalyst.expressions.{Collate, Collation, Expression, InputFileBlockLength, InputFileBlockStart, InputFileName, RowOrdering}
 import org.apache.spark.sql.catalyst.plans.logical._
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.catalyst.types.DataTypeUtils.toAttributes
@@ -34,7 +39,9 @@ import org.apache.spark.sql.catalyst.util.TypeUtils._
 import org.apache.spark.sql.classic.SparkSession
 import org.apache.spark.sql.connector.expressions.{FieldReference, RewritableTransform}
 import org.apache.spark.sql.errors.QueryCompilationErrors
+import org.apache.spark.sql.errors.QueryCompilationErrors.toSQLId
 import org.apache.spark.sql.execution.command.DDLUtils
+import org.apache.spark.sql.execution.command.ViewHelper.generateViewProperties
 import org.apache.spark.sql.execution.datasources.{CreateTable => CreateTableV1}
 import org.apache.spark.sql.execution.datasources.v2.FileDataSourceV2
 import org.apache.spark.sql.internal.SQLConf
@@ -56,14 +63,43 @@ class ResolveSQLOnFile(sparkSession: SparkSession) extends Rule[LogicalPlan] {
       val result = plan match {
         case u: UnresolvedRelation if maybeSQLFile(u) =>
           try {
-            val ds = resolveDataSource(u)
-            Some(LogicalRelation(ds.resolveRelation()))
+            // BEGIN-EDGE
+            val credential = Option(
+              u.options.get(CatalogTable.UNITY_CATALOG_STORAGE_CREDENTIAL_NAME)
+            )
+            // Tahoe only reads from the options as paths are not passed to Data Sources.
+            val (format, path) = (
+              u.multipartIdentifier.head,
+              ResolveWithCredential.injectUnityCatalogCredential(
+                u.multipartIdentifier.last,
+                sparkSession,
+                credential,
+                fallBackToPassthrough = true
+              )
+            )
+            val ds = resolveDataSource(u.copy(multipartIdentifier = Seq(format, path)))
+
+            // Do the resolution remotely in Databricks Connect, similar to df.read() case. This
+            // avoids needing to load the actual backing DataSource class on the client.
+            if (SparkClientContext.clientEnabled) {
+              val client = SparkClientManager.getForSession(sparkSession)
+              val df = client.readDataFrame(Some(format), None, Map.empty, Seq(path))
+              Some(df.queryExecution.logical)
+            } else {
+              Some(LogicalRelation(ds.resolveRelation()))
+            }
+            // END-EDGE
           } catch {
             case e: SparkUnsupportedOperationException =>
               u.failAnalysis(
                 errorClass = e.getCondition,
                 messageParameters = e.getMessageParameters.asScala.toMap)
             case _: ClassNotFoundException => None
+            // BEGIN-EDGE
+            case e: SecurityException => throw e
+            case e: UnauthorizedAccessException => throw e
+            case e: NoSuchStorageCredentialException => throw e
+            // END-EDGE
             case e: Exception if !e.isInstanceOf[AnalysisException] =>
               // the provider is valid, but failed to create a logical plan
               u.failAnalysis(
@@ -97,36 +133,87 @@ class ResolveSQLOnFile(sparkSession: SparkSession) extends Rule[LogicalPlan] {
     val ident = unresolved.multipartIdentifier
     val dataSource = DataSource(
       sparkSession,
-      paths = Seq(ident.last),
-      className = ident.head,
-      options = unresolved.options.asScala.toMap)
+      paths = Nil,
+      options = unresolved.options.asScala.toMap + ("path" -> ident.last),
+      className = ident.head)
     // `dataSource.providingClass` may throw ClassNotFoundException, the caller side will try-catch
     // it and return the original plan, so that the analyzer can report table not found later.
-    val isFileFormat = classOf[FileFormat].isAssignableFrom(dataSource.providingClass)
-    if (!isFileFormat ||
-      dataSource.className.toLowerCase(Locale.ROOT) == DDLUtils.HIVE_PROVIDER) {
-      unresolved.failAnalysis(
-        errorClass = "UNSUPPORTED_DATASOURCE_FOR_DIRECT_QUERY",
-        messageParameters = Map("dataSourceType" -> ident.head))
-    }
-    if (isFileFormat && ident.last.isEmpty) {
+    // Here we need to exclude `hive` as it's not a real FileFormat.
+    val isFileFormat = classOf[FileFormat].isAssignableFrom(dataSource.providingClass) &&
+      dataSource.className.toLowerCase(Locale.ROOT) != DDLUtils.HIVE_PROVIDER
+
+    // BEGIN-EDGE
+    val format = ident.head
+    val path = ident.last
+    val isTahoe = DeltaSourceUtilsEdge.isDeltaDataSourceName(format)
+
+    if ((isFileFormat || isTahoe) && ident.last.isEmpty) {
       unresolved.failAnalysis(
         errorClass = "INVALID_EMPTY_LOCATION",
         messageParameters = Map("location" -> ident.last))
     }
 
-    dataSource
+    // SC-78865: dataSource.resolveRelation would expose the file directory layout even if the
+    // user has no permission to access file. The regular permission checker only applies after
+    // the resolution is finished. So we need this hack to enforce the AnyFile permission.
+    CheckPermissions.checkSelectFilePermission(sparkSession, Seq(path))
+
+    if (isTahoe) {
+      DeltaValidation.validateDeltaRead(sparkSession, Option(path), options = Map.empty)
+    } else {
+      DeltaValidation.validateNonDeltaRead(sparkSession, Option(path), format)
+    }
+    // END-EDGE
+
+    if (isTahoe || isFileFormat) {
+      dataSource
+    } else {
+      unresolved.failAnalysis(
+        errorClass = "UNSUPPORTED_DATASOURCE_FOR_DIRECT_QUERY",
+        messageParameters = Map("dataSourceType" -> ident.head))
+    }
   }
 
   def apply(plan: LogicalPlan): LogicalPlan = plan resolveOperators {
+    // BEING-EDGE
+    case tt @ TimeTravel(u: UnresolvedRelation, _, _, _)
+        if maybeSQLFile(u) && tt.expressions.forall(_.resolved) =>
+      val formatName = u.multipartIdentifier.head
+      if (DeltaSourceUtilsEdge.isDeltaDataSourceName(formatName)) {
+        // Leave it to the DeltaCatalog
+        tt
+      } else {
+        // If we successfully look up the data source, there's exactly 2 parts, and the second
+        // part looks like an absolute path, this is a path-based but non-Delta table,
+        // so we should fail to time travel. Otherwise, this is some other catalog table that
+        // isn't resolved yet, so we should leave it be for now.
+        try {
+          DataSource.lookupDataSource(formatName, conf)
+          if (u.multipartIdentifier.size != 2 || !new Path(u.multipartIdentifier(1)).isAbsolute) {
+            tt
+          } else {
+            throw DeltaErrors.notADeltaTableException("Time travel")
+          }
+        } catch {
+          case _: ClassNotFoundException => tt
+        }
+      }
+    // END-EDGE
+
     case r @ RelationTimeTravel(u: UnresolvedRelation, timestamp, _)
         if maybeSQLFile(u) && timestamp.forall(_.resolved) =>
       // If we successfully look up the data source, then this is a path-based table, so we should
       // fail to time travel. Otherwise, this is some other catalog table that isn't resolved yet,
       // so we should leave it be for now.
       try {
-        resolveDataSource(u)
-        throw QueryCompilationErrors.timeTravelUnsupportedError(toSQLId(u.multipartIdentifier))
+        // EDGE: time travel is supported in path-based Delta tables.
+        if (!DeltaSourceUtilsEdge.isDeltaDataSourceName(u.multipartIdentifier.head)) {
+          resolveDataSource(u)
+          throw QueryCompilationErrors.timeTravelUnsupportedError(toSQLId(u.multipartIdentifier))
+        } else {
+          // Leave it to the DeltaCatalog
+          r
+        }
       } catch {
         case _: ClassNotFoundException => r
       }
@@ -141,6 +228,10 @@ class ResolveSQLOnFile(sparkSession: SparkSession) extends Rule[LogicalPlan] {
 case class PreprocessTableCreation(catalog: SessionCatalog) extends Rule[LogicalPlan] {
 
   def apply(plan: LogicalPlan): LogicalPlan = plan resolveOperators {
+    // Early exit for Delta. All checks happen within DeltaAnalysis and Delta's internal methods.
+    case c: CreateTableV1 if DeltaTableUtils.isDeltaTable(c.tableDesc) =>
+      c
+
     // When we CREATE TABLE without specifying the table schema, we should fail the query if
     // bucketing information is specified, as we can't infer bucketing from data files currently.
     // Since the runtime inferred partition columns could be different from what user specified,
@@ -157,6 +248,12 @@ case class PreprocessTableCreation(catalog: SessionCatalog) extends Rule[Logical
           errorClass = "SPECIFY_PARTITION_IS_NOT_ALLOWED",
           messageParameters = Map.empty)
       }
+      // BEGIN-EDGE
+      if (tableDesc.clusterBySpec.isDefined) {
+        throw QueryCompilationErrors
+          .specifyClusterByNotAllowedWhenTableSchemaNotDefinedError(tableDesc.qualifiedName)
+      }
+      // END-EDGE
       c
 
     // When we append data to an existing table, check if the given provider, partition columns,
@@ -183,7 +280,11 @@ case class PreprocessTableCreation(catalog: SessionCatalog) extends Rule[Logical
       // inserting into (i.e. using the same compression).
       // If the one of the provider is [[FileDataSourceV2]] and the other one is its corresponding
       // [[FileFormat]], the two providers are considered compatible.
-      if (fallBackV2ToV1(existingProvider) != fallBackV2ToV1(specifiedProvider)) {
+      val existingProviderV1 = fallBackV2ToV1(existingProvider)
+      val specifiedProviderV1 = fallBackV2ToV1(specifiedProvider)
+      val isCompatible = existingProviderV1.isAssignableFrom(specifiedProviderV1) ||
+        specifiedProviderV1.isAssignableFrom(existingProviderV1)
+      if (!isCompatible) {
         throw QueryCompilationErrors.mismatchedTableFormatError(
           tableName, existingProvider, specifiedProvider)
       }
@@ -326,6 +427,13 @@ case class PreprocessTableCreation(catalog: SessionCatalog) extends Rule[Logical
         partitioning, "in the partitioning", isCaseSensitive)
 
       if (schema.isEmpty) {
+        // BEGIN-EDGE
+        val maybeClusterBySpec = ClusterBySpec.extractClusterBySpec(partitioning)
+        if (maybeClusterBySpec.isDefined) {
+          throw QueryCompilationErrors
+            .specifyClusterByNotAllowedWhenTableSchemaNotDefinedError(create.tableName.name)
+        }
+        // END-EDGE
         if (partitioning.nonEmpty) {
           throw QueryCompilationErrors.specifyPartitionNotAllowedWhenTableSchemaNotDefinedError()
         }
@@ -379,8 +487,8 @@ case class PreprocessTableCreation(catalog: SessionCatalog) extends Rule[Logical
     }
 
     val normalizedProperties = table.properties ++ table.clusterBySpec.map { spec =>
-      ClusterBySpec.toProperty(schema, spec, conf.resolver)
-    }
+      ClusterBySpec.toProperties(schema, spec, conf.resolver)
+    }.getOrElse(Map.empty)
 
     table.copy(partitionColumnNames = normalizedPartCols, bucketSpec = normalizedBucketSpec,
       properties = normalizedProperties)
@@ -453,6 +561,7 @@ case class PreprocessTableCreation(catalog: SessionCatalog) extends Rule[Logical
   }
 }
 
+
 /**
  * Preprocess the [[InsertIntoStatement]] plan. Throws exception if the number of columns mismatch,
  * or specified partition columns are different from the existing partition columns in the target
@@ -465,6 +574,16 @@ object PreprocessTableInsertion extends ResolveInsertionBase {
       tblName: String,
       partColNames: StructType,
       catalogTable: Option[CatalogTable]): InsertIntoStatement = {
+
+    insert.replaceCriteriaOpt match {
+      case Some(_: InsertReplaceUsing) =>
+        // TODO(LC-6988): Support the case where INSERT REPLACE USING is equivalent to DPO
+        //  for non-Delta tables.
+        throw DeltaErrors.notADeltaTableException(operation = "INSERT REPLACE USING")
+      case Some(_: InsertReplaceOn) =>
+        throw DeltaErrors.notADeltaTableException(operation = "INSERT REPLACE ON")
+      case None =>
+    }
 
     val normalizedPartSpec = normalizePartitionSpec(
       insert.partitionSpec, partColNames, tblName, conf.resolver)
@@ -530,20 +649,21 @@ object PreprocessTableInsertion extends ResolveInsertionBase {
   }
 
   def apply(plan: LogicalPlan): LogicalPlan = plan resolveOperators {
-    case i @ InsertIntoStatement(table, _, _, query, _, _, _) if table.resolved && query.resolved =>
-      table match {
-        case relation: HiveTableRelation =>
-          val metadata = relation.tableMeta
-          preprocess(i, metadata.identifier.quotedString, metadata.partitionSchema,
-            Some(metadata))
-        case LogicalRelationWithTable(h: HadoopFsRelation, catalogTable) =>
-          val tblName = catalogTable.map(_.identifier.quotedString).getOrElse("unknown")
-          preprocess(i, tblName, h.partitionSchema, catalogTable)
-        case LogicalRelationWithTable(_: InsertableRelation, catalogTable) =>
-          val tblName = catalogTable.map(_.identifier.quotedString).getOrElse("unknown")
-          preprocess(i, tblName, new StructType(), catalogTable)
-        case _ => i
-      }
+    case i @ InsertIntoStatement(table, _, _, query, _, _, _, _)
+      if table.resolved && query.resolved =>
+        table match {
+          case relation: HiveTableRelation =>
+            val metadata = relation.tableMeta
+            preprocess(i, metadata.identifier.quotedString, metadata.partitionSchema,
+              Some(metadata))
+          case LogicalRelationWithTable(h: HadoopFsRelation, catalogTable) =>
+            val tblName = catalogTable.map(_.identifier.quotedString).getOrElse("unknown")
+            preprocess(i, tblName, h.partitionSchema, catalogTable)
+          case LogicalRelationWithTable(_: InsertableRelation, catalogTable) =>
+            val tblName = catalogTable.map(_.identifier.quotedString).getOrElse("unknown")
+            preprocess(i, tblName, new StructType(), catalogTable)
+          case _ => i
+        }
   }
 }
 
@@ -609,11 +729,11 @@ object PreWriteCheck extends (LogicalPlan => Unit) {
 
   def apply(plan: LogicalPlan): Unit = {
     plan.foreach {
-      case InsertIntoStatement(LogicalRelationWithTable(relation, _), partition,
-          _, query, _, _, _) =>
+      case InsertIntoStatement(l @ LogicalRelationWithTable(relation, _), partition,
+          _, query, _, _, _, _) =>
         // Get all input data source relations of the query.
         val srcRelations = query.collect {
-          case l: LogicalRelation => l.relation
+          case LogicalRelationWithTable(src, _) => src
         }
         if (srcRelations.contains(relation)) {
           throw new AnalysisException(
@@ -639,7 +759,7 @@ object PreWriteCheck extends (LogicalPlan => Unit) {
               messageParameters = Map("relationId" -> toSQLId(relation.toString)))
         }
 
-      case InsertIntoStatement(t, _, _, _, _, _, _)
+      case InsertIntoStatement(t, _, _, _, _, _, _, _)
         if !t.isInstanceOf[LeafNode] ||
           t.isInstanceOf[Range] ||
           t.isInstanceOf[OneRowRelation] ||
@@ -674,6 +794,58 @@ case class QualifyLocationWithWarehouse(catalog: SessionCatalog) extends Rule[Lo
       c.copy(tableDesc = newTable)
   }
 }
+
+object CollationCheck extends (LogicalPlan => Unit) {
+  def apply(plan: LogicalPlan): Unit = {
+    plan.foreach {
+      case operator: LogicalPlan =>
+        operator.expressions.foreach(_.foreach(
+          e =>
+            if (isCollationExpression(e) && !SQLConf.get.collationEnabled) {
+              throw QueryCompilationErrors.collationNotEnabledError()
+            }
+          )
+        )
+    }
+  }
+
+  private def isCollationExpression(expression: Expression): Boolean =
+    expression.isInstanceOf[Collation] || expression.isInstanceOf[Collate]
+}
+
+// BEGIN-EDGE
+/** Add query tags based on analyzed plan. */
+object AddQueryTags extends (LogicalPlan => Unit) with SQLConfHelper {
+  def apply(analyzedPlan: LogicalPlan): Unit = {
+    val active = Seq.empty
+    if (conf.getConf(SQLConf.QUERY_TAGGING_COALESCED_TRAVERSAL_ENABLED)) {
+      val detection = QueryTaggingUtils.detectTags(analyzedPlan)
+      if (detection.collation && !// Tag check: COLLATION_TAG - not supported in OSS) {
+        // Query tagging: COLLATION_TAG
+      }
+      if (detection.geography && !// Tag check: GEOGRAPHY_TAG - not supported in OSS) {
+        // Query tagging: GEOGRAPHY_TAG
+      }
+      if (detection.geometry && !// Tag check: GEOMETRY_TAG - not supported in OSS) {
+        // Query tagging: GEOMETRY_TAG
+      }
+    } else {
+      if (!// Tag check: COLLATION_TAG - not supported in OSS &&
+          // Collation detection - simplified for OSS(analyzedPlan)) {
+        // Query tagging: COLLATION_TAG
+      }
+      if (!// Tag check: GEOGRAPHY_TAG - not supported in OSS &&
+          // Geography detection - not supported in OSS(analyzedPlan)) {
+        // Query tagging: GEOGRAPHY_TAG
+      }
+      if (!// Tag check: GEOMETRY_TAG - not supported in OSS &&
+          // Geometry detection - not supported in OSS(analyzedPlan)) {
+        // Query tagging: GEOMETRY_TAG
+      }
+    }
+  }
+}
+// END-EDGE
 
 /**
  * This rule checks for references to views WITH SCHEMA [TYPE] EVOLUTION and synchronizes the
@@ -716,8 +888,25 @@ object ViewSyncSchemaToMetaStore extends (LogicalPlan => Unit) {
           }
           SchemaUtils.checkColumnNameDuplication(fieldNames.toImmutableArraySeq,
             session.sessionState.conf.resolver)
-          val updatedViewMeta = metaData.copy(schema = newSchema)
-          session.sessionState.catalog.alterTable(updatedViewMeta)
+          if (SQLConf.get.viewSchemaEvolutionMetadataCompatibility) {
+            val newProperties = if (viewSchemaMode == SchemaEvolution) {
+              generateViewProperties(
+                metaData.properties,
+                session,
+                fieldNames,
+                fieldNames,
+                metaData.viewSchemaMode)
+            } else {
+              metaData.properties
+            }
+            val updatedViewMeta = metaData.copy(schema = newSchema, properties = newProperties)
+            session.sessionState.catalog.alterTable(updatedViewMeta)
+          } else {
+            AnalysisContext.withAnalysisContext(CommandType.VIEW_SCHEMA_EVOLUTION) {
+              val updatedViewMeta = metaData.copy(schema = newSchema)
+              session.sessionState.catalog.alterTableViewSchemaEvolution(updatedViewMeta)
+            }
+          }
         }
       case _ => // OK
     }
