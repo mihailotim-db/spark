@@ -259,6 +259,13 @@ class ResolverGuardSuite extends ResolverGuardSuiteBase {
     checkResolverGuard("DESCRIBE QUERY SELECT * FROM VALUES (1)")
   }
 
+  test("SET command") {
+    checkResolverGuard("SET")
+    checkResolverGuard("SET spark.sql.shuffle.partitions=10")
+    checkResolverGuard("SET spark.sql.shuffle.partitions")
+    checkResolverGuard("SET -v")
+  }
+
   test("HAVING") {
     checkResolverGuard(
       "SELECT col1 FROM VALUES(1) GROUP BY col1 HAVING col1 > 1"

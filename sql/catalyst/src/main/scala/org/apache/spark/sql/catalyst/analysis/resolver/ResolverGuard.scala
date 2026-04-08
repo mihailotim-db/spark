@@ -151,6 +151,8 @@ class ResolverGuard(
         checkSort(sort)
       case supervisingCommand: SupervisingCommand =>
         None
+      case _: SetCommandBase =>
+        None
       case repartition: Repartition =>
         checkRepartition(repartition)
       case having: UnresolvedHaving =>
