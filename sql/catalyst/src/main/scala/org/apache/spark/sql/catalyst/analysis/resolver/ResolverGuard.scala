@@ -177,8 +177,6 @@ class ResolverGuard(
     expression match {
       case alias: Alias =>
         checkAlias(alias)
-      case multiAlias: MultiAlias =>
-        checkMultiAlias(multiAlias)
       case unresolvedConditionalExpression: ConditionalExpression =>
         checkUnresolvedConditionalExpression(unresolvedConditionalExpression)
       case unresolvedCast: Cast =>
@@ -726,6 +724,19 @@ object ResolverGuard {
     // Functions that are not resolved properly.
     // Functions that produce wrong schemas/plans because of alias assignment.
     map += ("from_json", ())
+    // Generator functions are not yet supported by the single-pass resolver.
+    map += ("collations", ())
+    map += ("explode", ())
+    map += ("explode_outer", ())
+    map += ("inline", ())
+    map += ("inline_outer", ())
+    map += ("json_tuple", ())
+    map += ("posexplode", ())
+    map += ("posexplode_outer", ())
+    map += ("stack", ())
+    map += ("sql_keywords", ())
+    map += ("variant_explode", ())
+    map += ("variant_explode_outer", ())
   }
 
   /**
@@ -741,8 +752,7 @@ object ResolverGuard {
   }
 
   /**
-   * Higher order functions that are supported but guarded under the
-   * `ANALYZER_SINGLE_PASS_RESOLVER_ENABLE_HIGHER_ORDER_FUNCTIONS_RESOLUTION` flag.
+   * Higher order functions that are not yet supported by the single-pass resolver.
    */
   private val HIGHER_ORDER_FUNCTIONS = {
     val map = new IdentifierMap[Unit]()
